@@ -43,6 +43,8 @@ python wayback_scanner.py -i scope_urls.txt -o ./recon_out
 
 # More threads, shorter lookback window
 python wayback_scanner.py -t 10 --years 2
+python wayback_scanner.py --debug
+python wayback_scanner.py -i interestingEXT.txt --years 7 --debug
 ```
 
 ---
