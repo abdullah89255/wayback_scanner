@@ -45,6 +45,8 @@ python wayback_scanner.py -i scope_urls.txt -o ./recon_out
 python wayback_scanner.py -t 10 --years 2
 python wayback_scanner.py --debug
 python wayback_scanner.py -i interestingEXT.txt --years 7 --debug
+python wayback_scanner.py -i interestingEXT.txt -o ./reports -d ./snapshots
+python wayback_scanner.py -i interestingEXT.txt                  # defaults: wayback_downloads/
 ```
 
 ---
