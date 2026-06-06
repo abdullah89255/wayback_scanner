@@ -1,23 +1,34 @@
 #!/usr/bin/env python3
 """
 Wayback Machine Sensitive URL Scanner  —  Bug Bounty Recon Tool
-Fixes vs v1:
-  - CDX: removed mimetype filter (catches JS/JSON/config/plain-text archives)
-  - CDX: removed strict statuscode:200 filter (use !=404 instead)
-  - CDX: increased limit, spread across years with smarter sampling
-  - Download: removed Content-Type gate (was blocking JS/JSON/config files)
-  - Download: use /web/<ts>id_/ flag (identity mode) instead of if_ — avoids
-    Wayback toolbar injection and redirect quirks
+
+Workflow:
+  1. Read URLs from interestingEXT.txt (or -i file)
+  2. Query Wayback CDX API for snapshots of each URL
+  3. Download ALL snapshots (not just ones with findings) to --download-dir
+     Subfolders: downloads/hits/  and  downloads/clean/
+  4. Scan every downloaded snapshot locally for sensitive patterns
+  5. Save full HTML report to the output directory
+
+Fixes applied (v2):
+  - CDX: no mimetype filter — catches JS/JSON/config/plain-text archives
+  - CDX: correct negation syntax  !statuscode:404
+  - Download: id_ flag for raw bytes (no Wayback toolbar injections)
   - Download: retry with exponential backoff on 429/503/connection errors
-  - Analysis: strip Wayback banner HTML before scanning to kill false positives
-  - Worker: scan ALL snapshots, pick richest; don't break on first hit
-  - Worker: verbose logging so you can see exactly what's happening per URL
+  - Download: ALL snapshots saved regardless of findings
+  - Download: non-HTML content wrapped in readable HTML shell
+  - Download: real file extension preserved in saved filename
+  - Analysis: Wayback banner stripped before scanning (kills false positives)
+  - Analysis: script-strip regex confined to single <script> block
+  - Threading: each thread owns its own requests.Session (thread-safe)
+  - Compat: type hints compatible with Python 3.8+
 
 Usage:
-    python wayback_scanner.py                       # reads interestingEXT.txt
+    python wayback_scanner.py                        # reads interestingEXT.txt
     python wayback_scanner.py -i urls.txt -o ./out
     python wayback_scanner.py --threads 5 --years 3
-    python wayback_scanner.py --debug               # print per-URL detail
+    python wayback_scanner.py --download-dir ./snaps # where raw files go
+    python wayback_scanner.py --debug                # per-URL/snapshot detail
 """
 
 import argparse
@@ -31,7 +42,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import requests
-from bs4 import BeautifulSoup
+from typing import List, Optional, Tuple
 
 # ══════════════════════════════════════════════════════════════
 # SENSITIVE PATTERNS
@@ -141,14 +152,19 @@ def log(msg, level="INFO"):
 # ══════════════════════════════════════════════════════════════
 
 def sanitize_filename(url: str, timestamp: str) -> str:
-    parsed = urllib.parse.urlparse(url)
-    path   = parsed.path.strip("/").replace("/", "__") or "index"
-    query  = parsed.query[:50].replace("&", "_").replace("=", "-") if parsed.query else ""
-    name   = f"{parsed.netloc}__{path}"
+    """Return a safe filename preserving the original extension.
+    Falls back to .html only when the URL has no recognised extension."""
+    parsed   = urllib.parse.urlparse(url)
+    url_path = parsed.path.strip("/").replace("/", "__") or "index"
+    query    = parsed.query[:50].replace("&", "_").replace("=", "-") if parsed.query else ""
+    name     = f"{parsed.netloc}__{url_path}"
     if query:
         name += f"__{query}"
-    name = re.sub(r'[^\w\-.]', '_', name)[:180]
-    return f"{timestamp}_{name}.html"
+    name     = re.sub(r'[^\w\-.]', '_', name)[:180]
+    raw_ext  = os.path.splitext(urllib.parse.urlparse(url).path)[1].lower()
+    ext      = raw_ext if raw_ext in SENSITIVE_EXTENSIONS else ".html"
+    base     = re.sub(r'\.[a-z0-9]{1,10}$', '', name, flags=re.IGNORECASE)
+    return f"{timestamp}_{base}{ext}"
 
 
 def get_ext(url: str) -> str:
@@ -165,7 +181,7 @@ def is_scannable_url(url: str) -> bool:
     return False   # unknown extension — skip
 
 
-def retry_get(session: requests.Session, url: str, params=None, timeout=25, max_tries=4) -> requests.Response | None:
+def retry_get(session: requests.Session, url: str, params=None, timeout=25, max_tries=4) -> Optional[requests.Response]:
     """GET with exponential backoff on rate-limit / transient errors."""
     wait = 2
     for attempt in range(1, max_tries + 1):
@@ -191,7 +207,7 @@ def retry_get(session: requests.Session, url: str, params=None, timeout=25, max_
 # CDX SNAPSHOT LOOKUP
 # ══════════════════════════════════════════════════════════════
 
-def fetch_snapshots(url: str, years: int, session: requests.Session) -> list[dict]:
+def fetch_snapshots(url: str, years: int, session: requests.Session) -> List[dict]:
     """
     Query CDX API.  Key fixes vs v1:
       - NO mimetype filter  →  catches JS, JSON, plain-text, config archives
@@ -208,7 +224,7 @@ def fetch_snapshots(url: str, years: int, session: requests.Session) -> list[dic
         "fl":       "timestamp,statuscode,mimetype,original",
         "collapse": "timestamp:6",      # one per month
         "from":     from_date,
-        "filter":   "statuscode:!404",  # exclude only hard 404s
+        "filter":   "!statuscode:404",  # exclude 404s (correct CDX negation syntax)
         "limit":    "20",
     }
     log(f"  CDX lookup: {url}", "DEBUG")
@@ -262,7 +278,7 @@ TEXT_TYPES = (
 )
 
 
-def download_snapshot(timestamp: str, original_url: str, session: requests.Session) -> tuple[str | None, str]:
+def download_snapshot(timestamp: str, original_url: str, session: requests.Session) -> Tuple[Optional[str], str]:
     """
     Download raw snapshot content.  Returns (text, archive_url).
     Key fixes vs v1:
@@ -297,7 +313,7 @@ def download_snapshot(timestamp: str, original_url: str, session: requests.Sessi
         return None, archive_url
 
     try:
-        text = r.content.decode(r.apparent_encoding or "utf-8", errors="replace")
+        text = r.content.decode(r.encoding or "utf-8", errors="replace")
     except Exception:
         text = r.text
 
@@ -321,15 +337,17 @@ def strip_wayback_artifacts(html: str) -> str:
     html = re.sub(r'<!-- BEGIN WAYBACK TOOLBAR INSERT -->.*?<!-- END WAYBACK TOOLBAR INSERT -->',
                   '', html, flags=re.DOTALL)
     # Inline script Wayback sometimes injects
-    html = re.sub(r'<script[^>]*>[\s\S]*?archive\.org[\s\S]*?</script>', '', html,
-                  flags=re.IGNORECASE)
+    html = re.sub(
+        r'<script[^>]*>(?:(?!</script>)[\s\S])*?archive\.org(?:(?!</script>)[\s\S])*?</script>',
+        '', html, flags=re.IGNORECASE
+    )
     return html
 
 # ══════════════════════════════════════════════════════════════
 # ANALYSIS
 # ══════════════════════════════════════════════════════════════
 
-def analyze_content(text: str) -> list[dict]:
+def analyze_content(text: str) -> List[dict]:
     """
     Scan raw content for sensitive patterns.
     Returns sorted list of findings (highest hit-count first).
@@ -400,10 +418,11 @@ def severity(count):
 def html_escape(s):
     return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace('"',"&quot;")
 
-def build_report(all_results: list[dict], output_path: str):
+def build_report(all_results: List[dict], output_path: str):
     now         = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     total_urls  = len(all_results)
-    total_snaps = sum(r["snapshots_checked"] for r in all_results)
+    total_snaps  = sum(r["snapshots_checked"] for r in all_results)
+    total_saved  = sum(r.get("snapshots_saved", 0) for r in all_results)
     hits        = [r for r in all_results if r["findings"]]
     total_finds = sum(len(r["findings"]) for r in all_results)
 
@@ -415,7 +434,7 @@ def build_report(all_results: list[dict], output_path: str):
         link  = f'<a href="{html_escape(r.get("saved_as","#"))}">📄 {html_escape(fname[:50])}</a>' if r.get("saved_as") else "—"
         trows += (f'<tr><td class="url"><a href="{html_escape(r["url"])}" target="_blank">'
                   f'{html_escape(r["url"][:90])}{"…" if len(r["url"])>90 else ""}</a></td>'
-                  f'<td>{r["snapshots_checked"]}</td>'
+                  f'<td>{r["snapshots_checked"]} checked / {r.get("snapshots_saved",0)} saved</td>'
                   f'<td>{len(r["findings"])}</td>'
                   f'<td>{pats}</td>'
                   f'<td>{link}</td></tr>\n')
@@ -478,6 +497,7 @@ def build_report(all_results: list[dict], output_path: str):
 <div class="stats">
   <div class="stat"><span class="n">{total_urls}</span><span class="l">URLs scanned</span></div>
   <div class="stat"><span class="n">{total_snaps}</span><span class="l">Snapshots checked</span></div>
+  <div class="stat"><span class="n">{total_saved}</span><span class="l">Snapshots saved</span></div>
   <div class="stat"><span class="n">{len(hits)}</span><span class="l">URLs with findings</span></div>
   <div class="stat"><span class="n">{total_finds}</span><span class="l">Pattern matches</span></div>
 </div>
@@ -499,13 +519,67 @@ def build_report(all_results: list[dict], output_path: str):
 # CORE WORKER
 # ══════════════════════════════════════════════════════════════
 
-def process_url(url: str, output_dir: Path, years: int, session: requests.Session) -> dict:
+def _save_snapshot(text: str, url: str, ts: str, arch_url: str,
+                   dest_dir: Path) -> str:
+    """
+    Save snapshot text to dest_dir as a proper HTML file.
+    Non-HTML content (JS/JSON/env/SQL …) is wrapped in a readable HTML shell
+    so every saved file opens correctly in a browser.
+    Returns the absolute path of the saved file.
+    """
+    raw_ext      = os.path.splitext(urllib.parse.urlparse(url).path)[1].lower()
+    is_html      = raw_ext in (".html", ".htm", "") and text.lstrip().startswith("<")
+    fname        = sanitize_filename(url, ts)
+    fpath        = dest_dir / fname
+
+    if is_html:
+        save_content = text
+    else:
+        esc_body     = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        save_content = (
+            '<!DOCTYPE html>\n<html lang="en"><head>'
+            '<meta charset="UTF-8">'
+            f'<title>{html_escape(url[:120])}</title>'
+            '<style>'
+            'body{background:#0d1117;color:#c9d1d9;margin:16px;font-family:sans-serif}'
+            'h3{color:#58a6ff}p{color:#8b949e;font-size:.85em}'
+            'pre{background:#161b22;padding:16px;border-radius:6px;'
+            'white-space:pre-wrap;word-break:break-all;font-size:.84em;'
+            'border:1px solid #21262d;overflow:auto}'
+            '</style></head><body>'
+            f'<h3>Archived snapshot — {html_escape(url[:120])}</h3>'
+            f'<p>Extension: <code>{raw_ext or "(none)"}</code>&nbsp;|&nbsp;'
+            f'Snapshot: <code>{ts}</code>&nbsp;|&nbsp;'
+            f'<a href="{html_escape(arch_url)}" target="_blank">Archive link</a></p>'
+            f'<pre>{esc_body}</pre>'
+            '</body></html>'
+        )
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    with open(fpath, "w", encoding="utf-8", errors="replace") as fh:
+        fh.write(save_content)
+    return str(fpath)
+
+
+def process_url(url: str, output_dir: Path, years: int,
+                session: requests.Session, download_dir: Path) -> dict:
+    """
+    Main worker per URL:
+      1. CDX lookup → get list of snapshots
+      2. Download EVERY snapshot unconditionally
+         • hits/  → snapshots that matched a sensitive pattern
+         • clean/ → snapshots with no pattern match
+      3. Scan each downloaded file locally
+      4. Return result dict (best findings across all snapshots)
+    """
     url = url.strip()
     result = {
         "url":               url,
         "snapshots_checked": 0,
-        "findings":          [],
-        "saved_as":          None,
+        "snapshots_saved":   0,       # total files written to disk
+        "findings":          [],      # findings from the richest snapshot
+        "saved_files":       [],      # ALL saved file paths
+        "saved_as":          None,    # path of the best (most findings) snapshot
         "archive_url":       None,
         "snapshot_ts":       None,
         "skip_reason":       "",
@@ -525,55 +599,71 @@ def process_url(url: str, output_dir: Path, years: int, session: requests.Sessio
     snapshots = fetch_snapshots(url, years, session)
 
     if not snapshots:
-        log(f"  ↳ No CDX snapshots found (URL may never have been crawled)", "WARN")
+        log(f"  ↳ No CDX snapshots found", "WARN")
         result["skip_reason"] = "no CDX snapshots found"
         return result
 
-    log(f"  ↳ {len(snapshots)} CDX snapshot(s) — scanning all …")
+    log(f"  ↳ {len(snapshots)} CDX snapshot(s) — downloading all …")
+
+    hits_dir  = download_dir / "hits"
+    clean_dir = download_dir / "clean"
 
     best_findings  = []
-    best_text      = None
-    best_snap      = None
+    best_snap_ts   = None
     best_arch_url  = None
+    best_fpath     = None
 
     for snap in snapshots:
         ts = snap["timestamp"]
-        log(f"  → snapshot {ts}  status={snap.get('statuscode','?')}  mime={snap.get('mimetype','?')}")
+        log(f"  → {ts}  status={snap.get('statuscode','?')}  mime={snap.get('mimetype','?')}",
+            "DEBUG")
 
         text, arch_url = download_snapshot(ts, url, session)
         result["snapshots_checked"] += 1
-        time.sleep(0.6)   # be polite to archive.org
+        time.sleep(0.8)   # polite inter-request delay (per snapshot, archive.org)
 
         if text is None:
+            log(f"    ✗ download failed / binary — skipped", "DEBUG")
             continue
 
+        # ── Scan locally ──────────────────────────────────────────────────
         findings = analyze_content(text)
-        log(f"    patterns matched: {len(findings)}")
+        log(f"    patterns matched: {len(findings)}", "DEBUG")
 
-        # Keep the snapshot with the most findings
+        # ── Save unconditionally to the correct subfolder ─────────────────
+        dest   = hits_dir if findings else clean_dir
+        fpath  = _save_snapshot(text, url, ts, arch_url, dest)
+        result["snapshots_saved"] += 1
+        result["saved_files"].append(fpath)
+
+        # ── Track the snapshot with the most findings ─────────────────────
         if len(findings) > len(best_findings):
             best_findings = findings
-            best_text     = text
-            best_snap     = ts
+            best_snap_ts  = ts
             best_arch_url = arch_url
+            best_fpath    = fpath
 
-    if best_findings and best_text:
-        result["findings"]    = best_findings
-        result["snapshot_ts"] = best_snap
-        result["archive_url"] = best_arch_url
+    # ── Populate result with best snapshot data ───────────────────────────
+    result["findings"]    = best_findings
+    result["snapshot_ts"] = best_snap_ts
+    result["archive_url"] = best_arch_url
+    result["saved_as"]    = best_fpath   # best (most findings) snapshot path
 
-        fname = sanitize_filename(url, best_snap)
-        fpath = output_dir / fname
-        with open(fpath, "w", encoding="utf-8", errors="replace") as fh:
-            fh.write(best_text)
-        result["saved_as"] = str(fpath)
-
+    saved_total = result["snapshots_saved"]
+    if best_findings:
         pattern_names = ", ".join(f["pattern"] for f in best_findings[:3])
-        log(f"  ✅ {len(best_findings)} finding(s): {pattern_names}  →  {fname}", "OK")
+        log(f"  ✅ {len(best_findings)} finding(s) [{pattern_names}] | "
+            f"{saved_total}/{result['snapshots_checked']} saved", "OK")
     else:
-        log(f"  ℹ  {result['snapshots_checked']} snapshot(s) checked — no sensitive patterns found")
-        result["skip_reason"] = f"{result['snapshots_checked']} snapshot(s) checked, no patterns matched"
+        log(f"  ℹ  {saved_total}/{result['snapshots_checked']} snapshot(s) saved — no sensitive patterns")
+        if not best_findings:
+            result["skip_reason"] = (
+                f"{result['snapshots_checked']} checked, "
+                f"{saved_total} saved, no sensitive patterns matched"
+            )
 
+    # Polite inter-URL pause (once per URL, not per snapshot)
+    time.sleep(1.0)
     return result
 
 # ══════════════════════════════════════════════════════════════
@@ -587,11 +677,15 @@ def main():
     parser.add_argument("-i", "--input",   default="interestingEXT.txt",
                         help="Input file with URLs (default: interestingEXT.txt)")
     parser.add_argument("-o", "--output",  default="wayback_results",
-                        help="Output directory (default: ./wayback_results)")
+                        help="Output directory for report (default: ./wayback_results)")
+    parser.add_argument("-d", "--download-dir", default="wayback_downloads",
+                        dest="download_dir",
+                        help="Where to save downloaded snapshots (default: ./wayback_downloads). "
+                             "Subfolders: hits/ (findings) and clean/ (no findings)")
     parser.add_argument("-t", "--threads", type=int, default=3,
-                        help="Parallel threads — keep low to avoid 429s (default: 3)")
+                        help="Parallel threads — keep ≤5 to avoid 429s (default: 3)")
     parser.add_argument("-y", "--years",   type=int, default=5,
-                        help="Look back N years (default: 5)")
+                        help="Look back N years in Wayback (default: 5)")
     parser.add_argument("--debug",         action="store_true",
                         help="Verbose debug output per URL/snapshot")
     args = parser.parse_args()
@@ -599,9 +693,12 @@ def main():
     global DEBUG_MODE
     DEBUG_MODE = args.debug
 
-    input_file = Path(args.input)
-    output_dir = Path(args.output)
+    input_file   = Path(args.input)
+    output_dir   = Path(args.output)
+    download_dir = Path(args.download_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    (download_dir / "hits").mkdir(parents=True, exist_ok=True)
+    (download_dir / "clean").mkdir(parents=True, exist_ok=True)
 
     if not input_file.exists():
         log(f"Input file not found: {input_file}", "FAIL")
@@ -617,25 +714,30 @@ def main():
 
     log(f"Loaded {len(urls)} URL(s) from {input_file}", "HEAD")
     log(f"Output : {output_dir.resolve()}", "HEAD")
+    log(f"Download dir : {download_dir.resolve()}", "HEAD")
     log(f"Threads: {args.threads}  |  Lookback: {args.years} yr(s)  |  Debug: {args.debug}", "HEAD")
     print()
 
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        )
-    })
+    # Each thread gets its own Session — requests.Session is NOT thread-safe
+    # when shared across threads (urllib3 connection pool corruption).
+    _UA = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+    def make_session() -> requests.Session:
+        s = requests.Session()
+        s.headers.update({"User-Agent": _UA})
+        return s
+
+    def worker(url: str) -> dict:
+        """Each call owns its own Session so threads never share state."""
+        return process_url(url, output_dir, args.years, make_session(), download_dir)
 
     all_results = []
 
     with ThreadPoolExecutor(max_workers=args.threads) as pool:
-        futures = {
-            pool.submit(process_url, url, output_dir, args.years, session): url
-            for url in urls
-        }
+        futures = {pool.submit(worker, url): url for url in urls}
         for future in as_completed(futures):
             try:
                 all_results.append(future.result())
@@ -647,10 +749,14 @@ def main():
     rpath = output_dir / f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
     build_report(all_results, str(rpath))
 
-    hits       = sum(1 for r in all_results if r["findings"])
-    total_find = sum(len(r["findings"]) for r in all_results)
+    hits        = sum(1 for r in all_results if r["findings"])
+    total_find  = sum(len(r["findings"]) for r in all_results)
+    total_saved = sum(r.get("snapshots_saved", 0) for r in all_results)
     log(f"URLs with findings  : {hits}/{len(urls)}", "OK")
     log(f"Total pattern hits  : {total_find}", "OK")
+    log(f"Snapshots saved     : {total_saved}  →  {download_dir.resolve()}", "OK")
+    log(f"  hits/  (findings) : {download_dir.resolve() / 'hits'}", "OK")
+    log(f"  clean/ (no match) : {download_dir.resolve() / 'clean'}", "OK")
     log(f"Report              : {rpath.resolve()}", "OK")
 
 
