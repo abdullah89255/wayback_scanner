@@ -63,5 +63,6 @@ wayback_results/
 ```bash
 export ANTHROPIC_BASE_URL="https://opencode.ai/zen"
 export ANTHROPIC_AUTH_TOKEN="sk-HBif2B4KKJH4ouBppWQ4z7gvNH3IKD6xMEaMSchAmxyWc9igv6ttwWRbsgsqQtVh"
-export ANTHROPIC_MODEL="minimax-m2.5-free" -export CLAUDE_CODE_USE_AUTH_TOKEN="true"
+export ANTHROPIC_MODEL="minimax-m2.5-free"
+export CLAUDE_CODE_USE_AUTH_TOKEN="true"
 ```
