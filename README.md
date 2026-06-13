@@ -60,5 +60,9 @@ wayback_results/
 ├── 20221109_app.target.com__config.html   ← raw snapshot with DB string
 └── ...
 ```
-
+```bash
 The report links directly to each saved snapshot file, so you can open the raw HTML locally to verify findings before reporting them.
+export ANTHROPIC_BASE_URL="https://opencode.ai/zen"
+export ANTHROPIC_AUTH_TOKEN=""
+export ANTHROPIC_MODEL="minimax-m2.5-free" -export CLAUDE_CODE_USE_AUTH_TOKEN="true"
+```
